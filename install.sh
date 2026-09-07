@@ -67,6 +67,25 @@ if [ "$(uname -s)" = "Linux" ] && ! ldconfig -p 2>/dev/null | grep -q portaudio;
   fi
 fi
 
+# --- Linux input access (Wayland hold-to-talk reads /dev/input directly
+#     through evdev, which needs the user in the `input` group; without it
+#     ptt.py falls back to pynput, which is useless under Wayland) ---
+if [ "$(uname -s)" = "Linux" ] && ! id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+  echo "-- the hold-to-talk key needs you in the 'input' group on Linux"
+  echo "   (Wayland gives pynput no keystrokes; evdev reads /dev/input,"
+  echo "   which is group 'input')"
+  read -r -p "   Add $USER to the 'input' group now (needs sudo)? [Y/n] " a
+  if [ "$a" != "n" ] && [ "$a" != "N" ]; then
+    if sudo usermod -aG input "$USER"; then
+      echo "   done — LOG OUT and back in (or reboot) for it to take effect."
+    else
+      echo "   couldn't add you; do it yourself: sudo usermod -aG input $USER"
+    fi
+  else
+    echo "   skipped — hold-to-talk will fall back to pynput (no Wayland support)."
+  fi
+fi
+
 # --- the Python environment ---
 echo "-- creating the environment (first run downloads ~900MB of packages)"
 uv venv .venv -q 2>/dev/null || true

@@ -16,6 +16,13 @@ dependencies = [
     "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
     "pynput>=1.8.0",
+    # Linux hold-to-talk. pynput's global listener is dead under a Wayland
+    # compositor (its X11 backend gets no events; its evdev backend needs
+    # root), so on Linux ptt.py reads /dev/input/event* directly through
+    # python-evdev instead -- Wayland-agnostic, needs only `input` group
+    # membership (install.sh offers to add you). Falls back to pynput if
+    # this import or device discovery fails, so nothing regresses.
+    "evdev>=1.6.0 ; sys_platform == 'linux'",
     "setuptools<81",
     "sounddevice>=0.5.0",
     "soundfile>=0.12.0",

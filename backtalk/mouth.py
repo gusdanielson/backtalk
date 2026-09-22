@@ -347,6 +347,15 @@ class Mouth:
         self._worker.start()
         self._reply_ctr = 0
         self._reply_lock = threading.Lock()
+        # Caption word-reveal rate, worker-thread-only (same rule as
+        # self._out). Seeded from a real measurement of this voice
+        # (2026-09-22, bm_lewis, speed 1.0: ~133 wpm on mixed prose and
+        # technical content - the old 165 constant was never measured,
+        # just guessed, and ran faster than this voice actually speaks).
+        # Refined after every sentence in _play_stream once its real
+        # duration is known, so it tracks whatever voice/speed is
+        # actually configured instead of staying a fixed guess.
+        self._est_wpm = 133.0
 
     @property
     def speaking(self) -> bool:
@@ -509,18 +518,22 @@ class Mouth:
                 from backtalk import signals as _sig
                 _sig.direction(directions)
             if reply_id is not None:
-                # No full-duration measurement here (streaming synthesis
-                # never buffers a whole sentence up front - that is audio
-                # law #2's whole point) - a face's word-by-word reveal
-                # gets a speaking-rate estimate instead of a measured one.
+                # No full-duration measurement for THIS sentence exists yet
+                # (streaming synthesis never buffers a whole sentence up
+                # front - that is audio law #2's whole point), so the reveal
+                # starts from the running estimate and gets corrected below
+                # once this sentence's real duration is known.
                 try:
-                    words_per_min = 165.0 * float(CFG.get("speed") or 1.0)
+                    speed = float(CFG.get("speed") or 1.0)
                 except (TypeError, ValueError):
-                    words_per_min = 165.0
-                word_ms = 60000.0 / max(60.0, words_per_min)
+                    speed = 1.0
+                word_ms = 60000.0 / max(60.0, self._est_wpm * speed)
                 signals.write_caption_chunk(sentence, word_ms, reply_id)
 
+            total_samples = 0
+
             def _write(pcm):
+                nonlocal total_samples
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
@@ -531,6 +544,7 @@ class Mouth:
                     if self._stop.is_set():
                         return False
                     signals.feed_waveform(pcm[i:i + block])
+                total_samples += len(pcm)
                 return True
             for pcm in head:
                 if not _write(pcm):
@@ -540,6 +554,18 @@ class Mouth:
                 if not _write(pcm):
                     self._cut()
                     return
+            # Sentence finished clean (no barge-in cut it short): the real
+            # duration is now known. Blend it into the running estimate
+            # (70% prior / 30% this sentence) rather than snapping straight
+            # to it, so one short/odd sentence can't swing the next
+            # sentence's timing wildly, while still tracking the real
+            # voice over the course of a reply.
+            if reply_id is not None and total_samples and rate:
+                words = len(sentence.split())
+                dur_s = total_samples / rate
+                if words and dur_s > 0.05:
+                    measured_wpm = max(60.0, min(300.0, (words / dur_s) * 60.0))
+                    self._est_wpm = 0.7 * self._est_wpm + 0.3 * measured_wpm
         except Exception:
             self._drop_out()
             raise

@@ -28,6 +28,7 @@ is the whole integration surface:
   .voice_caption      JSON {text, start_ts, word_ms, reply_id, final} —
                       written the instant a chunk's audio starts playing,
                       so start_ts lines up with what is actually heard
+  .voice_activity     JSON {ts, items:[{t,kind,label}]} — recent tool use
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -57,6 +58,7 @@ _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _CAPTION_FILE = os.path.join(_DIR, ".voice_caption")
+_ACTIVITY_FILE = os.path.join(_DIR, ".voice_activity")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -67,6 +69,9 @@ _THINKING_SOUND = CFG.get("thinking_sound") or ""
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
+
+_ACTIVITY_MAX = 8                   # a glanceable log, not a scrollback
+_activity_ring: list[dict] = []
 
 
 def set_state(name: str):
@@ -174,6 +179,33 @@ def mark_caption_final(reply_id: int):
             with open(_CAPTION_FILE, "w") as f:
                 f.write(json.dumps(data))
     except (OSError, ValueError):
+        pass
+
+
+def activity(kind: str, label: str):
+    """One tool the agent just reached for — ("read", "mouth.py"),
+    ("run", "git status") — appended to a short rolling log any face can
+    draw. Only the newest _ACTIVITY_MAX survive. Never raises."""
+    kind = str(kind or "").strip()[:12]
+    label = " ".join(str(label or "").split())[:60]
+    if not kind and not label:
+        return
+    _activity_ring.append({"t": time.time(), "kind": kind, "label": label})
+    del _activity_ring[:-_ACTIVITY_MAX]
+    try:
+        with open(_ACTIVITY_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(),
+                                "items": list(_activity_ring)}))
+    except OSError:
+        pass
+
+
+def activity_clear():
+    """A fresh turn is starting — wipe the rolling tool log. Never raises."""
+    _activity_ring.clear()
+    try:
+        os.remove(_ACTIVITY_FILE)
+    except OSError:
         pass
 
 

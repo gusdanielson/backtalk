@@ -48,6 +48,48 @@ from backtalk.vlog import log
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
+def _tool_activity(name: str, tool_input: dict):
+    """A tool call -> a short (kind, label) for the on-screen activity
+    ticker (signals.activity). Purely cosmetic and best-effort: an
+    unfamiliar tool just shows its own lowercased name."""
+    d = tool_input or {}
+
+    def _base(p):
+        p = str(p or "").replace("\\", "/").rstrip("/")
+        return p.rsplit("/", 1)[-1] or p
+
+    n = name or ""
+    if n == "Read":
+        return "read", _base(d.get("file_path"))
+    if n in ("Edit", "MultiEdit"):
+        return "edit", _base(d.get("file_path"))
+    if n == "Write":
+        return "write", _base(d.get("file_path"))
+    if n == "NotebookEdit":
+        return "edit", _base(d.get("notebook_path"))
+    if n == "Bash":
+        cmd = " ".join(str(d.get("command", "")).split())
+        return "run", (str(d.get("description") or "").strip() or cmd)
+    if n == "Grep":
+        return "grep", str(d.get("pattern", ""))
+    if n == "Glob":
+        return "find", str(d.get("pattern", ""))
+    if n == "WebFetch":
+        from urllib.parse import urlparse
+        return "fetch", (urlparse(str(d.get("url", ""))).netloc
+                         or str(d.get("url", "")))
+    if n == "WebSearch":
+        return "search", str(d.get("query", ""))
+    if n == "Task":
+        return "agent", str(d.get("description")
+                            or d.get("subagent_type") or "")
+    if n == "TodoWrite":
+        return "plan", ""
+    if n.startswith("mcp__"):
+        return "tool", n.split("__", 2)[-1]
+    return n.lower(), ""
+
+
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
@@ -341,6 +383,19 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "AssistantMessage":
+                # Cosmetic: surface each tool the model reaches for on the
+                # signal bus so a face can draw a live activity ticker.
+                # Never let bookkeeping break the turn.
+                for b in getattr(msg, "content", []) or []:
+                    if type(b).__name__ == "ToolUseBlock":
+                        try:
+                            kind, label = _tool_activity(
+                                getattr(b, "name", ""),
+                                getattr(b, "input", None))
+                            signals.activity(kind, label)
+                        except Exception:
+                            pass
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)

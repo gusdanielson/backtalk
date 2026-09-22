@@ -928,6 +928,7 @@ async def amain():
             return True
         signals.set_state("thinking")
         signals.static_start()
+        signals.activity_clear()   # each turn's tool ticker starts clean
         # Clean the pipe: drain the interrupted turn's leftovers so the
         # new question can't pair with a stale ResultMessage. A gate
         # that fired in the meantime resolves first, or the drain would

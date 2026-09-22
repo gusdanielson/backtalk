@@ -54,7 +54,7 @@ Never default `agent_dir` to whatever folder Claude Code happens to be running i
 Ask about each, configure what they want:
 
 - **A face:** two companions read the signal bus this repo writes.
-  - **ai-visualizer** (github.com/jaredrhod/ai-visualizer): four full-screen faces including the circuit board. Either set `signals_dir` here to that repo's folder, or set `bus_dir` there to this folder. One direction, not both.
+  - **ai-visualizer** (github.com/jaredrhod/ai-visualizer): four full-screen faces including the circuit board. Either set `signals_dir` here to that repo's folder, or set `bus_dir` there to this folder. One direction, not both. It also picks up the tool-activity ticker this repo publishes, on by default there.
   - **barehands** (github.com/jaredrhod/barehands): set `barehands_state_dir` to its `state/` folder path and the on-screen ring becomes the agent's face, live with the voice.
   If they have neither, one sentence: "there are companion repos that give it a face on screen, for later if you want."
 - **Extra folders:** anything beyond `agent_dir` the agent should reach in voice sessions (a notes vault, a projects folder) goes in `extra_dirs`.

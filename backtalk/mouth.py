@@ -345,27 +345,43 @@ class Mouth:
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+        self._reply_ctr = 0
+        self._reply_lock = threading.Lock()
 
     @property
     def speaking(self) -> bool:
         return self._speaking.is_set()
 
-    def say(self, text: str):
-        """Queue text (split to sentences) for speech."""
-        for s in split_sentences(text):
-            self._q.put((s, None))
+    def new_reply_id(self) -> int:
+        """A fresh id shared by every chunk of one logical reply, so the
+        caption bus can tell 'still this reply' from 'a new one started'."""
+        with self._reply_lock:
+            self._reply_ctr += 1
+            return self._reply_ctr
 
-    def say_chunk(self, text: str, directions=None):
+    def say(self, text: str):
+        """Queue text (split to sentences) for speech. All sentences here
+        are one logical reply for captioning purposes."""
+        reply_id = self.new_reply_id()
+        for s in split_sentences(text):
+            self._q.put((s, None, reply_id))
+
+    def say_chunk(self, text: str, directions=None, reply_id=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        `reply_id` groups chunks of one reply for captioning; pass the
+        same id (from new_reply_id()) across every call for one reply, or
+        omit it to treat this call as its own standalone reply."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None,
+                        reply_id if reply_id is not None else self.new_reply_id()))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -394,8 +410,7 @@ class Mouth:
     def _run(self):
         from backtalk import signals
         while True:
-            item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            sentence, directions, reply_id = self._q.get()
             if not sentence:
                 continue
             self._stop.clear()
@@ -404,7 +419,7 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions)
+                self._play_stream(sentence, directions, reply_id)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -413,6 +428,8 @@ class Mouth:
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
+                    if reply_id is not None:
+                        signals.mark_caption_final(reply_id)
                     self.ducker.speech_end()
                     signals.set_state("idle")
 
@@ -465,8 +482,8 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, directions=None, block: int = 2205,
-                     prebuffer_s: float = 0.75):
+    def _play_stream(self, sentence: str, directions=None, reply_id=None,
+                     block: int = 2205, prebuffer_s: float = 0.75):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
         whichever engine actually answered."""
@@ -491,6 +508,17 @@ class Mouth:
             if directions:
                 from backtalk import signals as _sig
                 _sig.direction(directions)
+            if reply_id is not None:
+                # No full-duration measurement here (streaming synthesis
+                # never buffers a whole sentence up front - that is audio
+                # law #2's whole point) - a face's word-by-word reveal
+                # gets a speaking-rate estimate instead of a measured one.
+                try:
+                    words_per_min = 165.0 * float(CFG.get("speed") or 1.0)
+                except (TypeError, ValueError):
+                    words_per_min = 165.0
+                word_ms = 60000.0 / max(60.0, words_per_min)
+                signals.write_caption_chunk(sentence, word_ms, reply_id)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):

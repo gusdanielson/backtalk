@@ -25,6 +25,9 @@ is the whole integration surface:
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_caption      JSON {text, start_ts, word_ms, reply_id, final} —
+                      written the instant a chunk's audio starts playing,
+                      so start_ts lines up with what is actually heard
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -53,6 +56,7 @@ _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_CAPTION_FILE = os.path.join(_DIR, ".voice_caption")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -141,6 +145,35 @@ def reply_done():
         with open(_REPLY_DONE_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time()}))
     except OSError:
+        pass
+
+
+def write_caption_chunk(text: str, word_ms: float, reply_id: int):
+    """Called right as a chunk's audio starts playing, so start_ts lines
+    up with what the listener actually hears — a face computes its
+    word-by-word reveal timing from this timestamp, not from whenever
+    synthesis happened to finish. Never raises."""
+    try:
+        with open(_CAPTION_FILE, "w") as f:
+            f.write(json.dumps({"text": text, "start_ts": time.time(),
+                                "word_ms": word_ms, "reply_id": reply_id,
+                                "final": False}))
+    except OSError:
+        pass
+
+
+def mark_caption_final(reply_id: int):
+    """Called once a reply's queue drains, same moment as reply_done().
+    Only applies if reply_id still matches, so a straggling write can't
+    mark a newer reply's caption final. Never raises."""
+    try:
+        with open(_CAPTION_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("reply_id") == reply_id:
+            data["final"] = True
+            with open(_CAPTION_FILE, "w") as f:
+                f.write(json.dumps(data))
+    except (OSError, ValueError):
         pass
 
 

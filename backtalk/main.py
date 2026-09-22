@@ -587,6 +587,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    reply_id = mouth.new_reply_id()  # shared by every chunk of this reply
 
     def emit(raw: str):
         nonlocal first, batch, pending
@@ -608,14 +609,14 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mouth.say_chunk(s, pending, reply_id)
             pending = []
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
+                mouth.say_chunk(" ".join(batch), pending, reply_id)
                 pending = []
                 batch = []
 
@@ -623,7 +624,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         async for sentence in brain.ask_stream(text):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch), pending)
+            mouth.say_chunk(" ".join(batch), pending, reply_id)
             pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing

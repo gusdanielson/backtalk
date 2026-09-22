@@ -349,13 +349,15 @@ class Mouth:
         self._reply_lock = threading.Lock()
         # Caption word-reveal rate, worker-thread-only (same rule as
         # self._out). Seeded from a real measurement of this voice
-        # (2026-09-22, bm_lewis, speed 1.0: ~133 wpm on mixed prose and
-        # technical content - the old 165 constant was never measured,
-        # just guessed, and ran faster than this voice actually speaks).
-        # Refined after every sentence in _play_stream once its real
+        # (2026-09-22, bm_lewis, speed 1.0: ~152 wpm on punchy
+        # conversational replies - an earlier measurement on mixed prose
+        # and technical content read ~133 wpm, but voice-session replies
+        # run faster than that; the old 165 constant before either
+        # measurement was never measured at all, just guessed).
+        # Refined after every chunk in _play_stream once its real
         # duration is known, so it tracks whatever voice/speed is
         # actually configured instead of staying a fixed guess.
-        self._est_wpm = 133.0
+        self._est_wpm = 152.0
 
     @property
     def speaking(self) -> bool:
@@ -555,17 +557,25 @@ class Mouth:
                     self._cut()
                     return
             # Sentence finished clean (no barge-in cut it short): the real
-            # duration is now known. Blend it into the running estimate
-            # (70% prior / 30% this sentence) rather than snapping straight
-            # to it, so one short/odd sentence can't swing the next
-            # sentence's timing wildly, while still tracking the real
-            # voice over the course of a reply.
+            # duration is now known. Blend it into the running estimate,
+            # weighted by how many words it covers (up to 20) rather than
+            # a flat split - a one-word chunk like "Nothing." has its
+            # duration dominated by punctuation pause, not speaking pace,
+            # so weighting it equally with a 30+ word chunk let short
+            # chunks drag the estimate back down every time a longer one
+            # pulled it toward the real rate, and it never converged
+            # (measured live 2026-09-22: stayed 1-3s behind for an entire
+            # reply instead of settling). Longer chunks are a cleaner
+            # signal and now correct the estimate faster; short ones barely
+            # nudge it.
             if reply_id is not None and total_samples and rate:
                 words = len(sentence.split())
                 dur_s = total_samples / rate
                 if words and dur_s > 0.05:
                     measured_wpm = max(60.0, min(300.0, (words / dur_s) * 60.0))
-                    self._est_wpm = 0.7 * self._est_wpm + 0.3 * measured_wpm
+                    weight = min(1.0, words / 20.0) * 0.5
+                    self._est_wpm = ((1 - weight) * self._est_wpm
+                                      + weight * measured_wpm)
         except Exception:
             self._drop_out()
             raise

@@ -164,6 +164,10 @@ def warm():
             # Before kokoro makes this run's scratch dirs, clear the ones
             # earlier runs could not clean up on their way out.
             _sweep_orphan_espeak_tempdirs()
+            # This CPU (Sandy Bridge, no AVX2) can't run NNPACK; torch
+            # warns on every load, then falls back anyway. Skip the attempt.
+            import torch
+            torch.backends.nnpack.set_flags(False)
             from kokoro import KPipeline
             # The voice name's first letter IS the language pipeline:
             # a=American English, b=British English, e/f/h/i/j/p/z = the

@@ -42,6 +42,31 @@ FRAME_MS = 30
 FRAME_LEN = RATE * FRAME_MS // 1000  # samples per frame
 OPEN_FRAMES = 4        # ~120ms speech to open an utterance
 MAX_UTTER_S = 30
+SHORT_UTTER_FRAMES = 20  # ~600ms of VAD speech: under this, a filler
+                         # transcript is more likely hallucinated than said
+
+# Open-mic hallucination defenses. Whisper's known failure mode on
+# near-silent/noisy audio is to invent text instead of returning nothing,
+# and hands-free mode used to hand every invention to the agent as a turn
+# (2026-09-22 live test: "Thanks for watching!" x35, a 28x "Okay." run).
+# Push-to-talk skips all of this: the held key already proves intent.
+NOISE_SNR = 1.5          # median speech-frame RMS must be ~3.5dB over the
+                         # room's noise floor, or it's the room, not a voice
+NO_SPEECH_MAX = 0.6      # Whisper's own "this segment is silence" score
+LOGPROB_MIN = -1.0       # below this Whisper is guessing
+COMPRESSION_MAX = 2.4    # gzip ratio above this = repetition loop
+REPEAT_MIN = 4           # "help help help help" / "okay." x28
+
+# Whisper was trained on captioned video, so on silence it reaches for
+# YouTube outros. Rejected at any length (short transcripts only).
+_OUTRO_MARKERS = ("for watching", "subscribe", "end of the video",
+                  "next video", "subtitles by", "amara org",
+                  "see you next time")
+# Fillers that are only suspect when the capture was short.
+_SHORT_FILLERS = {"okay", "ok", "thank you", "thanks", "bye", "bye bye",
+                  "i'm sorry", "so", "um", "hmm", "uh"}
+# Never a real turn on its own.
+_ALWAYS_FILLERS = {"you", "thank you so much", "thank you very much"}
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 
@@ -323,22 +348,73 @@ def warm():
     return _model
 
 
-def transcribe(pcm: np.ndarray) -> str:
+def _confident(seg) -> bool:
+    """Whisper's per-segment self-assessment. faster-whisper gives
+    objects, mlx_whisper gives dicts, with the same field names."""
+    get = seg.get if isinstance(seg, dict) else lambda k: getattr(seg, k)
+    return (get("no_speech_prob") <= NO_SPEECH_MAX
+            and get("avg_logprob") >= LOGPROB_MIN
+            and get("compression_ratio") <= COMPRESSION_MAX)
+
+
+def transcribe(pcm: np.ndarray, strict: bool = False) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
-    if nothing remains, it was silence."""
+    if nothing remains, it was silence.
+
+    strict (open mic): run faster-whisper's Silero VAD over the clip and
+    drop segments Whisper itself isn't confident in, so noise that fooled
+    webrtcvad comes back empty instead of as an invented sentence."""
     model = warm()
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
     if _backend == "mlx":
         import mlx_whisper
-        text = mlx_whisper.transcribe(audio, path_or_hf_repo=model,
-                                      temperature=0.0, language=lang,
-                                      verbose=None)["text"].strip()
+        segments = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=model, temperature=0.0, language=lang,
+            condition_on_previous_text=not strict, verbose=None)["segments"]
+        text_of = lambda s: s["text"]
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
-        text = "".join(s.text for s in segments).strip()
-    return _NONSPEECH.sub("", text).strip()
+        segments, _ = model.transcribe(
+            audio, temperature=0.0, language=lang, vad_filter=strict,
+            condition_on_previous_text=not strict)
+        text_of = lambda s: s.text
+    kept = []
+    for seg in segments:
+        if strict and not _confident(seg):
+            log(f"[ears] dropped low-confidence segment: {text_of(seg)!r}")
+            continue
+        kept.append(text_of(seg))
+    return _NONSPEECH.sub("", "".join(kept).strip()).strip()
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, punctuation out, and a phrase repeated back to back
+    collapsed to one copy ("Okay. Okay. Okay." -> "okay")."""
+    words = re.sub(r"[^\w\s']", " ", text.lower()).split()
+    for unit in range(1, len(words) // 2 + 1):
+        if len(words) % unit == 0 and \
+           words == words[:unit] * (len(words) // unit):
+            return " ".join(words[:unit])
+    return " ".join(words)
+
+
+def hallucination_reason(text: str, speech_frames: int) -> str | None:
+    """Why an open-mic transcript looks invented, or None if it's fine."""
+    words = re.sub(r"[^\w\s']", " ", text.lower()).split()
+    core = _normalize(text)
+    if not core:
+        return "no speech found"
+    if words and len(words) >= REPEAT_MIN and \
+       len(words) // max(len(core.split()), 1) >= REPEAT_MIN:
+        return "repetition loop"
+    if core in _ALWAYS_FILLERS:
+        return "filler"
+    if len(words) <= 8 and any(m in core for m in _OUTRO_MARKERS):
+        return "video-outro phrase"
+    if speech_frames < SHORT_UTTER_FRAMES and core in _SHORT_FILLERS:
+        return "short filler"
+    return None
 
 
 class Ears:
@@ -360,6 +436,8 @@ class Ears:
         speech_total = 0
         in_utterance = False
         elapsed = 0.0
+        floor = None                  # running RMS of the room's non-speech
+        speech_rms: list[float] = []
 
         with _open_mic() as stream:
             while True:
@@ -375,7 +453,11 @@ class Ears:
                     ring.clear()
                     continue
                 is_speech = self.vad.is_speech(mono.tobytes(), RATE)
+                rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
                 if not in_utterance:
+                    if not is_speech:
+                        floor = rms if floor is None else \
+                            0.95 * floor + 0.05 * rms
                     ring.append(mono)
                     if len(ring) > 8:
                         ring.pop(0)
@@ -388,19 +470,35 @@ class Ears:
                     frames.append(mono)
                     if is_speech:
                         speech_total += 1
+                        speech_rms.append(rms)
                         silence_run = 0
                     else:
                         silence_run += 1
                     if silence_run >= self.silence_frames or \
                        len(frames) * FRAME_MS / 1000 > MAX_UTTER_S:
+                        text, why = None, None
+                        snr = (float(np.median(speech_rms)) / floor
+                               if floor and speech_rms else None)
                         if speech_total < 8:
                             # <240ms of actual speech: a noise blip, not
-                            # a sentence — keep listening
-                            in_utterance = False
-                            frames, ring = [], []
-                            speech_run = speech_total = 0
-                            continue
-                        return transcribe(np.concatenate(frames))
+                            # a sentence
+                            why = "blip"
+                        elif snr is not None and snr < NOISE_SNR:
+                            why = f"too quiet (snr {snr:.1f})"
+                        else:
+                            text = transcribe(np.concatenate(frames),
+                                              strict=True)
+                            why = hallucination_reason(text, speech_total)
+                        if why is None:
+                            log(f"[ears] heard ({speech_total * FRAME_MS}ms"
+                                f" speech, snr {snr or 0:.1f})")
+                            return text
+                        if why != "blip":
+                            log(f"[ears] ignored {text!r}: {why}")
+                        # not a real utterance — keep listening
+                        in_utterance = False
+                        frames, ring, speech_rms = [], [], []
+                        speech_run = speech_total = 0
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:

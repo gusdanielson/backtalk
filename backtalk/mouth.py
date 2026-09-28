@@ -341,6 +341,9 @@ class Mouth:
         from backtalk.ducking import Ducker
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        # Sticky, unlike _stop (which _run clears at every sentence): once
+        # set, the worker finishes its current synth step and exits.
+        self._quit = threading.Event()
         self._speaking = threading.Event()
         # The one persistent output stream (audio law #1).
         # Worker-thread-only — never touch from other threads.
@@ -409,8 +412,19 @@ class Mouth:
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
-        (the debounced restore timer dies with the process otherwise)."""
+        (the debounced restore timer dies with the process otherwise).
+
+        Also joins the worker. It is a daemon thread, and if it is still
+        inside a torch op (Kokoro synth) when the interpreter finalizes,
+        its GIL re-acquire triggers pthread_exit through pybind11's
+        noexcept gil_scoped_release -> std::terminate -> SIGABRT at exit
+        (coredump 2026-09-27)."""
+        self._quit.set()
         self.shut_up()
+        self._q.put(None)   # wake the worker if it is idle on get()
+        self._worker.join(timeout=10)
+        if self._worker.is_alive():
+            log("[mouth] speech worker did not stop within 10s")
         self.ducker.restore_now()
 
     def wait_done(self, timeout: float | None = None):
@@ -425,7 +439,10 @@ class Mouth:
     def _run(self):
         from backtalk import signals
         while True:
-            sentence, directions, reply_id = self._q.get()
+            item = self._q.get()
+            if item is None or self._quit.is_set():
+                return
+            sentence, directions, reply_id = item
             if not sentence:
                 continue
             self._stop.clear()
@@ -508,6 +525,8 @@ class Mouth:
         banked = 0
         rate = None
         for rate_, pcm in gen:
+            if self._quit.is_set():
+                return
             rate = rate_
             head.append(pcm)
             banked += len(pcm)
@@ -541,13 +560,13 @@ class Mouth:
             def _write(pcm):
                 nonlocal total_samples
                 for i in range(0, len(pcm), block):
-                    if self._stop.is_set():
+                    if self._stop.is_set() or self._quit.is_set():
                         return False
                     out.write(pcm[i:i + block])
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
-                    if self._stop.is_set():
+                    if self._stop.is_set() or self._quit.is_set():
                         return False
                     signals.feed_waveform(pcm[i:i + block])
                 total_samples += len(pcm)
